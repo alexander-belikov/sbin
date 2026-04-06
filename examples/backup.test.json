@@ -1,0 +1,33 @@
+{
+  "local_root": "~",
+  "remote_root": "username@host:backup_dir",
+  "paths": [
+    ".bashrc",
+    "projects"
+  ],
+  "exclude": [
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    "env/",
+    ".next/",
+    "dist/",
+    "build/",
+    "out/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".cache/",
+    ".npm/",
+    ".yarn/",
+    "*.log",
+    "*.swp",
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    "*.tmp",
+    ".bak",
+    ".sync",
+    ".unison*"
+  ]
+}

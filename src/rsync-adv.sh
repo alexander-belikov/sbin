@@ -1,124 +1,97 @@
 #!/bin/bash
-# Multi-path rsync driver: reads local/remote roots, path list, and excludes from JSON.
-# Depends: jq, rsync; remote targets use ssh when DST contains ':' (host:path).
-
 set -euo pipefail
 
+# --- Help & Defaults ---
 usage() {
     cat <<EOF
-Usage: $0 <mode> [config.json] [--checksum]
+Usage: $0 <backup|restore|dry-run> [config.json] [options]
 
-MODES:
-  backup   Push local -> remote (deletes on remote extra files under synced paths)
-  restore  Pull remote -> local (-u: skip files newer on local)
-  dry-run  Default if mode is anything else: show what backup would do
-
-OPTIONS:
-  --checksum, -c   Rsync -c: compare by checksum (slower, stricter than mtime/size)
-
-Config JSON keys:
-  local_root, remote_root, paths[] (relative to roots), exclude[] (optional)
-
-Example active_paths.json:
-  { "local_root": "~/data", "remote_root": "host:backups/data",
-    "paths": ["photos", "docs"], "exclude": [".DS_Store", "*.tmp"] }
+Options:
+  -c, --checksum       Use checksums (slower, more reliable)
+  --limit <speed>      Limit bandwidth (e.g., 500K, 2M, 10M)
+  --burst              Disable bandwidth limits (Full speed)
+  
+Config JSON: { "local_root": "...", "remote_root": "...", "paths": [], "exclude": [] }
 EOF
     exit 1
 }
 
-if [[ $# -lt 1 ]]; then
-    usage
-fi
+[[ $# -lt 1 ]] && usage
 
-command -v jq >/dev/null 2>&1 || { echo "Error: jq is required." >&2; exit 1; }
-command -v rsync >/dev/null 2>&1 || { echo "Error: rsync is required." >&2; exit 1; }
-
-MODE=$1
+# --- Initialization ---
+MODE=$1; shift
 CONF="active_paths.json"
-USE_CHECKSUM=false
+BW_LIMIT="1M" # Default to a safe 1MB/s to prevent network collapse
+CHECKSUM=""
 
-shift
+# --- Argument Parsing ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --checksum|-c) USE_CHECKSUM=true; shift ;;
-        *.json) CONF="$1"; shift ;;
-        *) echo "Unknown argument: $1" >&2; usage ;;
+        -c|--checksum) CHECKSUM="-c"; shift ;;
+        --limit)       BW_LIMIT="$2"; shift 2 ;;
+        --burst)       BW_LIMIT=""; shift ;;
+        *.json)        CONF="$1"; shift ;;
+        *) echo "Unknown arg: $1"; usage ;;
     esac
 done
 
-if [[ ! -f "$CONF" ]]; then
-    echo "Error: config not found: $CONF" >&2
-    exit 1
+[[ ! -f "$CONF" ]] && { echo "Error: Config $CONF not found"; exit 1; }
+
+# --- Load Config ---
+eval "$(jq -r '@sh "L_ROOT=\(.local_root) R_ROOT=\(.remote_root)"' "$CONF")"
+L_ROOT="${L_ROOT/#\~/$HOME}"
+
+# --- Setup Rsync Flags ---
+# -a: archive, -z: compress, -h: human-readable
+# --info=progress2: Total job progress
+# --partial: keep partially transferred files
+OPTS=("-azh" "--info=progress2" "--partial")
+[[ -n "$CHECKSUM" ]] && OPTS+=("$CHECKSUM")
+
+# Bandwidth Limiting
+if [[ -n "$BW_LIMIT" ]]; then
+    echo ">> Limiting speed to $BW_LIMIT to prevent network timeouts."
+    OPTS+=("--bwlimit=$BW_LIMIT")
 fi
 
-# Tilde only expanded on local side; remote_root is passed to rsync as-is
-L_ROOT=$(jq -r '.local_root' "$CONF" | sed "s|^~|$HOME|")
-R_ROOT=$(jq -r '.remote_root' "$CONF")
-
-BASE_OPTS=(-azh --info=progress2)
-if [[ "$USE_CHECKSUM" == true ]]; then
-    echo ">> Checksum comparison enabled (slower) <<"
-    BASE_OPTS+=(-c)
-fi
-
-RUN=false
 case "$MODE" in
-    backup)
-        echo "!! BACKUP: $L_ROOT -> $R_ROOT !!"
-        SRC="$L_ROOT"
-        DST="$R_ROOT"
-        OPTS=("${BASE_OPTS[@]}" --delete)
-        RUN=true
-        ;;
-    restore)
-        echo "!! RESTORE: $R_ROOT -> $L_ROOT !!"
-        SRC="$R_ROOT"
-        DST="$L_ROOT"
-        OPTS=("${BASE_OPTS[@]}" -u)
-        RUN=true
-        ;;
-    *)
-        echo ">> DRY-RUN (use backup or restore to apply) <<"
-        SRC="$L_ROOT"
-        DST="$R_ROOT"
-        OPTS=("${BASE_OPTS[@]}" --delete --dry-run)
-        ;;
+    backup)  SRC="$L_ROOT"; DST="$R_ROOT"; OPTS+=("--delete") ;;
+    restore) SRC="$R_ROOT"; DST="$L_ROOT"; OPTS+=("-u") ;;
+    dry-run) SRC="$L_ROOT"; DST="$R_ROOT"; OPTS+=("--delete" "--dry-run") ;;
+    *) usage ;;
 esac
 
+# --- Execution ---
 TMP_EXC=$(mktemp)
 trap 'rm -f "$TMP_EXC"' EXIT
-jq -r '.exclude[]?' "$CONF" >"$TMP_EXC"
+jq -r '.exclude[]?' "$CONF" > "$TMP_EXC"
 
 mapfile -t paths < <(jq -r '.paths[]' "$CONF")
 
+echo "--- Starting $MODE ---"
 for p in "${paths[@]}"; do
-    rel_path=$(echo "$p" | sed 's|^/||;s|^\~\/||;s|/$||')
+    rel_path=$(echo "$p" | sed 's|^/*||; s|^~/*||')
+    
+    slash=""
+    [[ -d "$L_ROOT/$rel_path" ]] && slash="/"
 
-    src_suffix=""
-    dst_suffix=""
-    if [[ -d "$L_ROOT/$rel_path" ]]; then
-        src_suffix="/"
-        dst_suffix="/"
+    # Create remote parent directory
+    if [[ "$MODE" == "backup" && "$R_ROOT" == *":"* ]]; then
+        host="${R_ROOT%%:*}"
+        rem_dir="${R_ROOT#*:}/$(dirname "$rel_path")"
+        ssh "$host" "mkdir -p '$rem_dir'"
+    elif [[ "$MODE" == "backup" ]]; then
+        mkdir -p "$(dirname "$R_ROOT/$rel_path")"
     fi
 
-    dest_dir="$DST/$(dirname "$rel_path")"
-    if [[ "$dest_dir" == *":"* ]]; then
-        host="${dest_dir%%:*}"
-        rem_p="${dest_dir#*:}"
-        if $RUN; then
-            ssh "$host" "mkdir -p -- '$rem_p'"
-        fi
-    else
-        if $RUN; then
-            mkdir -p "$dest_dir"
-        fi
-    fi
-
-    echo "--- Syncing: $rel_path ---"
-    rsync "${OPTS[@]}" --exclude-from="$TMP_EXC" \
-        "$SRC/$rel_path$src_suffix" \
-        "$DST/$rel_path$dst_suffix"
+    echo ">> Syncing: $rel_path"
+    
+    # ionice -c 3: Only uses disk when system is idle
+    # nice -n 19: Lowest CPU priority
+    ionice -c 3 nice -n 19 rsync "${OPTS[@]}" \
+          --exclude-from="$TMP_EXC" \
+          "$SRC/$rel_path$slash" \
+          "$DST/$rel_path$slash"
 done
 
-echo ""
 echo "Operation complete."
